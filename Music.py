@@ -198,8 +198,8 @@ parser.add_argument('-content', help='Content input')
 parser.add_argument('-content_weight', help='Content weight. Default is 1e2', default = 1e2)
 parser.add_argument('-style', help='Style input')
 parser.add_argument('-style_weight', help='Style weight. Default is 1', default = 1)
-parser.add_argument('-epochs', type=int, help='Number of epoch iterations. Default is 20000', default = 10000)
-parser.add_argument('-print_interval', type=int, help='Number of epoch iterations between printing losses', default = 1000)
+parser.add_argument('-epochs', type=int, help='Number of epoch iterations. Default is 20000', default = 5000)
+parser.add_argument('-print_interval', type=int, help='Number of epoch iterations between printing losses', default = 50)
 parser.add_argument('-plot_interval', type=int, help='Number of epoch iterations between plot points', default = 1000)
 parser.add_argument('-learning_rate', type=float, default = 0.002)
 
@@ -215,7 +215,7 @@ a_style, sr = wav2spectrum(STYLE_FILENAME)
 a_content_torch = torch.from_numpy(a_content)[None, None, :, :]
 if cuda:
     a_content_torch = a_content_torch.cuda()
-print(a_content_torch.shape)
+print(f"content", a_content_torch.shape)
 a_style_torch = torch.from_numpy(a_style)[None, None, :, :]
 if cuda:
     a_style_torch = a_style_torch.cuda()
@@ -322,20 +322,37 @@ def train(model, a_C, a_S, a_G_var, optimizer, content_weight, style_weight, num
         # Forward pass to get the generated features
         a_G = model(a_G_var)
 
-        # Compute content and style losses
-        content_loss = content_weight * compute_content_loss(a_C, a_G)
+        # Compute style loss every iteration
         style_loss = style_weight * compute_layer_style_loss(a_S, a_G)
-        total_loss = content_loss + style_loss
+        style_loss.backward(retain_graph=True)
 
-        # Backward pass and optimization
-        total_loss.backward(retain_graph=True)
+        # Compute content loss every second iteration
+        if epoch % 2 == 0:
+            content_loss = content_weight * compute_content_loss(a_C, a_G)
+            content_loss.backward(retain_graph=True)
+        else:
+            content_loss = torch.tensor(0.0)  # No content loss update on odd iterations
+            if cuda:
+                content_loss = content_loss.cuda()
+
+        # Perform optimization step
         optimizer.step()
+
+        # Compute total loss for logging
+        total_loss = content_loss + style_loss
 
         # Print training progress
         if epoch % print_every == 0:
             print(f"{epoch} {epoch/num_epochs*100:.2f}% {timeSince(start)} "
                   f"content_loss: {content_loss.item():.4f} style_loss: {style_loss.item():.4f} total_loss: {total_loss.item():.4f}")
             current_loss += total_loss.item()
+
+        # Save the generated audio every 500 epochs
+        if epoch % 500 == 0:
+            gen_spectrum = a_G_var.cpu().data.numpy().squeeze()
+            gen_audio_filename = f"{OUTPUT_DIR}_epoch_{epoch}.wav"
+            spectrum2wav(gen_spectrum, sr, gen_audio_filename)
+            print(f"Saved audio at epoch {epoch}: {gen_audio_filename}")
 
         # Record losses for plotting
         if epoch % plot_every == 0:

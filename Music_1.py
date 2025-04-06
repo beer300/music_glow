@@ -221,6 +221,22 @@ num_epochs = args.epochs
 print_every = args.print_interval
 plot_every = args.plot_interval
 
+def timeSince(start):
+    """
+    Calculate the elapsed time since the start time and format it as a string.
+
+    Args:
+        start (float): Start time (from time.time()).
+
+    Returns:
+        str: Formatted string showing elapsed time in minutes and seconds.
+    """
+    now = time.time()
+    elapsed = now - start
+    minutes = math.floor(elapsed / 60)
+    seconds = elapsed - minutes * 60
+    return f"{minutes}m {seconds:.2f}s"
+
 # Modify the train function to optimize only for content loss
 def train_content_only(model, a_C, a_G_var, optimizer, content_weight, num_epochs, print_every, plot_every):
     """
