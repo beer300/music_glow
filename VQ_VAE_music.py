@@ -248,6 +248,15 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
 
             # Update the progress bar with the current loss
             progress_bar.set_postfix(loss=loss.item())
+    model_save_path = os.path.join(os.path.dirname(save_path), 'model')
+    os.makedirs(model_save_path, exist_ok=True)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': num_epochs,
+        'final_loss': loss.item(),
+    }, os.path.join(model_save_path, 'vqvae_final.pth'))
+    print(f"Model saved to {os.path.join(model_save_path, 'vqvae_final.pth')}")
     return loss, reconstruction_loss, vq_loss, commitment_loss
         # Print epoch loss
 
@@ -263,8 +272,16 @@ if __name__ == "__main__":
                 output_channels=1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Optional: Load existing model
+    model_path = r"C:\Users\lukas\Music\VQ_project\reconstructed_audio\model\vqvae_final.pth"
+    if os.path.exists(model_path):
+        checkpoint = torch.load(model_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded model from {model_path}")
+
     loss, reconstruction_loss, vq_loss, commitment_loss = train_vqvae(model, dataloader, num_epochs=10, device=device)
 
     plt.figure()
     plt.plot(loss)
-    plt.savefig("C:\Users\lukas\Music\VQ_project\losses" + "loss_curve.png")
+    plt.savefig(os.path.join(r"C:\Users\lukas\Music\VQ_project\losses", "loss_curve.png"))
