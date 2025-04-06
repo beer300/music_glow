@@ -48,6 +48,7 @@ class Encoder(nn.Module):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         return self.resblocks(x)
+    
 class Decoder(nn.Module):
     def __init__(self, embedding_dim, output_channels):
         super(Decoder, self).__init__()
@@ -130,6 +131,7 @@ class VQVAE(nn.Module):
         original_w = x.size(3)
 
         # Encode and decode
+
         z_e = self.encoder(x)
 
         z_q, vq_loss = self.vq(z_e)
@@ -226,11 +228,17 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
                             print(f"Error saving reconstructed audio: {str(e)}")
                     
                     # Generate and save audio from random vectors
-                    random_z = torch.randn_like(z_q).to(device)
-                    random_output = model.decoder(random_z)
+                    random_z = torch.randn_like(x).to(device)
+                    random_output = model.encoder(random_z)
+                    z_q, vq_loss = model.vq(random_output)
+
+                    x_reconstructed = model.decoder(z_q)
+
                     
+                    
+
                     for i in range(2):  # Save 2 random samples
-                        random_spectrogram = random_output[i].cpu().squeeze(0).numpy()
+                        random_spectrogram = x_reconstructed[i].cpu().squeeze(0).numpy()
                         random_spectrogram = random_spectrogram.astype(np.float32)
                         
                         random_save_file = os.path.join(
@@ -282,6 +290,41 @@ if __name__ == "__main__":
 
     loss, reconstruction_loss, vq_loss, commitment_loss = train_vqvae(model, dataloader, num_epochs=10, device=device)
 
+    # Create losses directory if it doesn't exist
+    losses_dir = os.path.join(r"C:\Users\lukas\Music\VQ_project\losses")
+    os.makedirs(losses_dir, exist_ok=True)
+
+    # Move tensors to CPU before plotting
+    if isinstance(loss, torch.Tensor):
+        loss = loss.cpu().numpy()
+    if isinstance(reconstruction_loss, torch.Tensor):
+        reconstruction_loss = reconstruction_loss.cpu().numpy()
+    if isinstance(vq_loss, torch.Tensor):
+        vq_loss = vq_loss.cpu().numpy()
+    if isinstance(commitment_loss, torch.Tensor):
+        commitment_loss = commitment_loss.cpu().numpy()
+
+    # Plot and save loss curves
     plt.figure()
     plt.plot(loss)
-    plt.savefig(os.path.join(r"C:\Users\lukas\Music\VQ_project\losses", "loss_curve.png"))
+    plt.title('Total Loss')
+    plt.savefig(os.path.join(losses_dir, "loss_curve.png"))
+    plt.close()
+
+    plt.figure()
+    plt.plot(reconstruction_loss)
+    plt.title('Reconstruction Loss')
+    plt.savefig(os.path.join(losses_dir, "reconstruction_loss_curve.png"))
+    plt.close()
+
+    plt.figure()
+    plt.plot(vq_loss)
+    plt.title('VQ Loss')
+    plt.savefig(os.path.join(losses_dir, "vq_loss_curve.png"))
+    plt.close()
+
+    plt.figure()
+    plt.plot(commitment_loss)
+    plt.title('Commitment Loss')
+    plt.savefig(os.path.join(losses_dir, "commitment_loss_curve.png"))
+    plt.close()
