@@ -205,29 +205,44 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
                 'commitment_loss': f'{commitment_loss.item():.4f}'
             })
             # Save reconstructed audio every 10% of an epoch
-            if batch_idx % (len(dataloader) // 10) == 0:
-                print(f"Saving reconstructed audio at epoch {epoch + 1}, batch {batch_idx}")
+            if batch_idx % (len(dataloader) // 4) == 0:
+                print(f"Saving audio at epoch {epoch + 1}, batch {batch_idx}")
                 model.eval()
                 with torch.no_grad():
-                    for i in range(min(3, x.size(0))):
-                        # Get spectrogram and ensure proper type conversion
+                    # Save reconstructed audio
+                    for i in range(min(2, x.size(0))):
                         spectrogram = x_reconstructed[i].cpu().squeeze(0).numpy()
                         spectrogram = spectrogram.astype(np.float32)
                         
-                        # Create unique filename
                         save_file = os.path.join(
                             save_path, 
                             f'epoch_{epoch+1}_batch_{batch_idx}_sample_{i}.wav'
                         )
                         
                         try:
-                            # Convert and save audio
-                            original_sr = 44100
-                            spectrum2wav(spectrogram, original_sr, save_file)
-                            print(f"Saved audio sample {i} to {save_file}")
+                            spectrum2wav(spectrogram, 44100, save_file)
+                            print(f"Saved reconstructed audio sample {i}")
                         except Exception as e:
-                            print(f"Error saving audio sample {i}: {str(e)}")
-                            continue
+                            print(f"Error saving reconstructed audio: {str(e)}")
+                    
+                    # Generate and save audio from random vectors
+                    random_z = torch.randn_like(z_q).to(device)
+                    random_output = model.decoder(random_z)
+                    
+                    for i in range(2):  # Save 2 random samples
+                        random_spectrogram = random_output[i].cpu().squeeze(0).numpy()
+                        random_spectrogram = random_spectrogram.astype(np.float32)
+                        
+                        random_save_file = os.path.join(
+                            save_path, 
+                            f'epoch_{epoch+1}_random_output_{i}.wav'
+                        )
+                        
+                        try:
+                            spectrum2wav(random_spectrogram, 44100, random_save_file)
+                            print(f"Saved random audio sample {i}")
+                        except Exception as e:
+                            print(f"Error saving random audio: {str(e)}")
                 
                 model.train()
 
@@ -252,4 +267,4 @@ if __name__ == "__main__":
 
     plt.figure()
     plt.plot(loss)
-    plt.savefig("C:\Users\lukas\Music\VQ_project\reconstructed_audio" + "loss_curve.png")
+    plt.savefig("C:\Users\lukas\Music\VQ_project\losses" + "loss_curve.png")
