@@ -1,3 +1,4 @@
+from matplotlib import pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -150,9 +151,9 @@ class VQVAE(nn.Module):
         # Total loss
         total_loss = reconstruction_loss + vq_loss + commitment_loss
 
-        return total_loss
+        return total_loss, reconstruction_loss, vq_loss, commitment_loss
     
-def train_vqvae(model, dataloader, num_epochs, device, save_path="reconstructed_audio"):
+def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\lukas\Music\VQ_project\reconstructed_audio"):
     """
     Train the VQ-VAE model and save reconstructed audio every 10% of an epoch.
 
@@ -189,7 +190,7 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path="reconstructed_
             # Compute loss
             z_e = model.encoder(x)
             z_q, _ = model.vq(z_e)
-            loss = model.compute_loss(x, x_reconstructed, z_e, z_q, vq_loss)
+            loss, reconstruction_loss, vq_loss, commitment_loss = model.compute_loss(x, x_reconstructed, z_e, z_q, vq_loss)
 
             # Backward pass and optimization
             optimizer.zero_grad()
@@ -199,9 +200,9 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path="reconstructed_
             total_loss += loss.item()
             progress_bar.set_postfix({
                 'total_loss': f'{loss.item():.4f}',
- 
+                'reconstruction_loss': f'{reconstruction_loss.item():.4f}',
                 'vq_loss': f'{vq_loss.item():.4f}',
-
+                'commitment_loss': f'{commitment_loss.item():.4f}'
             })
             # Save reconstructed audio every 10% of an epoch
             if batch_idx % (len(dataloader) // 10) == 0:
@@ -232,11 +233,11 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path="reconstructed_
 
             # Update the progress bar with the current loss
             progress_bar.set_postfix(loss=loss.item())
-
+    return loss, reconstruction_loss, vq_loss, commitment_loss
         # Print epoch loss
 
 if __name__ == "__main__":
-    data_path = r"C:\Users\lukas\Music\chopped_segments"
+    data_path = r"C:\Users\lukas\Music\youtube_playlist_chopped"
     dataset = WavDataset(data_path)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
@@ -247,4 +248,8 @@ if __name__ == "__main__":
                 output_channels=1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_vqvae(model, dataloader, num_epochs=10, device=device)
+    loss, reconstruction_loss, vq_loss, commitment_loss = train_vqvae(model, dataloader, num_epochs=10, device=device)
+
+    plt.figure()
+    plt.plot(loss)
+    plt.savefig("C:\Users\lukas\Music\VQ_project\reconstructed_audio" + "loss_curve.png")
