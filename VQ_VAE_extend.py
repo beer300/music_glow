@@ -9,7 +9,7 @@ import os
 from data_load_extended import WavDataset  # Import WavDataset from data_load.py
 from data_load_extended import spectrum2wav  # Import spectrum2wav from data_load.py
 from tqdm import tqdm  # Import tqdm for the progress bar
-
+from torch.cuda.amp import autocast, GradScaler
 N_FFT = 512
 N_CHANNELS = round(1 + N_FFT/2)
 OUT_CHANNELS = 32
@@ -141,7 +141,7 @@ class VQVAE(nn.Module):
         # Crop to original input size
         x_reconstructed = x_reconstructed[:, :, :original_h, :original_w]
 
-        return x_reconstructed, vq_loss
+        return x_reconstructed, vq_loss, z_e, z_q
     def compute_loss(self, x, x_reconstructed, z_e, z_q, vq_loss):
 
         # Reconstruction loss (MSE)
@@ -156,47 +156,34 @@ class VQVAE(nn.Module):
         return total_loss, reconstruction_loss, vq_loss, commitment_loss
     
 def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\lukas\Music\VQ_project_extended\reconstructed_audio"):
-    """
-    Train the VQ-VAE model and save reconstructed audio every 10% of an epoch.
-    Also saves model checkpoint after each epoch.
-    """
+    ...
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cuda")  # <- NEW
 
-    # Create directory to save reconstructed audio
-    os.makedirs(save_path, exist_ok=True)
-    
-    # Create directory for model checkpoints
-    model_save_path = os.path.join(os.path.dirname(save_path), 'model')
-    os.makedirs(model_save_path, exist_ok=True)
-
+    ...
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
 
-        # Initialize the progress bar
-        progress_bar = tqdm(dataloader, 
-                          desc=f"Epoch {epoch + 1}/{num_epochs}",
-                          unit="batch")
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", unit="batch")
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Extract spectrograms and move them to the device
-            _, x, filenames = batch  # x is the spectrogram, filenames are the file names
+            _, x, filenames = batch
             x = x.to(device)
 
-            # Forward pass
-            x_reconstructed, vq_loss = model(x)
-
-            # Compute loss
-            z_e = model.encoder(x)
-            z_q, _ = model.vq(z_e)
-            loss, reconstruction_loss, vq_loss, commitment_loss = model.compute_loss(x, x_reconstructed, z_e, z_q, vq_loss)
-
-            # Backward pass and optimization
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
 
+            with torch.amp.autocast("cuda"):  # <- ENABLE MIXED PRECISION
+                x_reconstructed, vq_loss, z_e, z_q = model(x)
+
+                loss, reconstruction_loss, vq_loss, commitment_loss = model.compute_loss(x, x_reconstructed, z_e, z_q, vq_loss)
+
+            # Use scaler to scale the loss and call backward
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
             total_loss += loss.item()
             progress_bar.set_postfix({
                 'total_loss': f'{loss.item():.4f}',
@@ -208,6 +195,17 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
             if batch_idx % (len(dataloader) // 1) == 0:
                 print(f"Saving audio at epoch {epoch + 1}, batch {batch_idx}")
                 model.eval()
+                model_save_path = os.path.join(os.path.dirname(save_path), 'model')
+                os.makedirs(model_save_path, exist_ok=True)
+                
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch + 1,
+                    'loss': loss.item(),
+                }, os.path.join(model_save_path, f'vqvae_epoch_{epoch+1}.pth'))
+                
+                print(f"Model saved for epoch {epoch+1} to {os.path.join(model_save_path, f'vqvae_epoch_{epoch+1}.pth')}")
                 with torch.no_grad():
                     # Save reconstructed audio
                     for i in range(min(2, x.size(0))):
@@ -249,31 +247,20 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
                             print(f"Saved random audio sample {i}")
                         except Exception as e:
                             print(f"Error saving random audio: {str(e)}")
-                
+                        
                 model.train()
 
             # Update the progress bar with the current loss
             progress_bar.set_postfix(loss=loss.item())
-        
-        # Save model checkpoint after each epoch
-        checkpoint_path = os.path.join(model_save_path, f'vqvae_epoch_{epoch+1}.pth')
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': total_loss / len(dataloader),
-        }, checkpoint_path)
-        print(f"Saved model checkpoint to {checkpoint_path}")
-
-    # Save final model
-    final_model_path = os.path.join(model_save_path, 'vqvae_final.pth')
+    model_save_path = os.path.join(os.path.dirname(save_path), 'model')
+    os.makedirs(model_save_path, exist_ok=True)
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'epoch': num_epochs,
         'final_loss': loss.item(),
-    }, final_model_path)
-    print(f"Model saved to {final_model_path}")
+    }, os.path.join(model_save_path, 'vqvae_final.pth'))
+    print(f"Model saved to {os.path.join(model_save_path, 'vqvae_final.pth')}")
     return loss, reconstruction_loss, vq_loss, commitment_loss
         # Print epoch loss
 def process_audio(train_mode=0, audio_path=None, model_path=None, device=None):
