@@ -193,7 +193,7 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
             })
             # Save reconstructed audio every 10% of an epoch
             if batch_idx % (len(dataloader) // 1) == 0:
-                print(f"Saving audio at epoch {epoch + 1}, batch {batch_idx}")
+                print(f"📀 Saving audio at epoch {epoch + 1}, batch {batch_idx}")
                 model.eval()
                 model_save_path = os.path.join(os.path.dirname(save_path), 'model')
                 os.makedirs(model_save_path, exist_ok=True)
@@ -205,7 +205,7 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
                     'loss': loss.item(),
                 }, os.path.join(model_save_path, f'vqvae_epoch_{epoch+1}.pth'))
                 
-                print(f"Model saved for epoch {epoch+1} to {os.path.join(model_save_path, f'vqvae_epoch_{epoch+1}.pth')}")
+                print(f"✅💾 Model saved for epoch {epoch+1} to {os.path.join(model_save_path, f'vqvae_epoch_{epoch+1}.pth')}")
                 with torch.no_grad():
                     # Save reconstructed audio
                     for i in range(min(2, x.size(0))):
@@ -219,9 +219,9 @@ def train_vqvae(model, dataloader, num_epochs, device, save_path=r"C:\Users\luka
                         
                         try:
                             spectrum2wav(spectrogram, 44100, save_file)
-                            print(f"Saved reconstructed audio sample {i}")
+                            print(f"✅🎧 Saved reconstructed audio sample {i}")
                         except Exception as e:
-                            print(f"Error saving reconstructed audio: {str(e)}")
+                            print(f"❌🚫 Error saving reconstructed audio: {str(e)}")
                     
                     # Generate and save audio from random vectors
                     random_z = torch.randn_like(x).to(device)
@@ -378,11 +378,11 @@ def process_audio(train_mode=0, audio_path=None, model_path=None, device=None):
                             
                             reconstructed_spec = reconstructed[0].cpu().squeeze(0).numpy()
                             spectrum2wav(reconstructed_spec, 44100, output_path)
-                            print(f"Processed {file} -> {output_path}")
+                            print(f"🎯🔍 Processed {file} → {output_path} ✅🎵")
                             break
                             
                 except Exception as e:
-                    print(f"Error processing {file}: {str(e)}")
+                    print(f"❌💥 Error processing {file}: {str(e)} ⚠️")
 
 # Update the main block to use the new function
 if __name__ == "__main__":
