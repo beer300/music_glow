@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from wavenet_1_dataloader import WaveNetDataset  # Corrected import
 import torch.optim as optim  # Import optimizer
+import numpy as np  # Import for saving audio
+from scipy.io.wavfile import write  # Import for saving audio as WAV
+
 class WaveNet(nn.Module):
     def __init__(self, input_channels, residual_channels, dilation_channels, skip_channels, kernel_size, num_classes, num_layers):
         super(WaveNet, self).__init__()
@@ -93,7 +96,9 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     # Training loop
+# Training loop
     model.train()  # Set model to training mode
+    step = 0  # Initialize step counter
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         for batch in dataloader:
@@ -117,6 +122,16 @@ if __name__ == "__main__":
 
             # Accumulate loss
             epoch_loss += loss.item()
+
+            # Save audio every 500 steps
+            if step % 500 == 0:
+                # Convert model output to audio signal
+                predicted_audio = torch.argmax(outputs, dim=1).squeeze().cpu().numpy()
+                audio_path = f"generated_audio_step_{step}.wav"
+                write(audio_path, 16000, predicted_audio.astype(np.int16))  # Save as 16-bit PCM WAV
+                print(f"Saved audio at step {step}: {audio_path}")
+
+            step += 1  # Increment step counter
 
         # Print epoch loss
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
