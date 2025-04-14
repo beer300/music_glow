@@ -8,6 +8,7 @@ import numpy as np  # Import for saving audio
 from scipy.io.wavfile import write  # Import for saving audio as WAV
 from tqdm import tqdm
 import matplotlib.pyplot as plt 
+import os
 class WaveNet(nn.Module):
     def __init__(self, input_channels, residual_channels, dilation_channels, skip_channels, kernel_size, num_classes, num_layers):
         super(WaveNet, self).__init__()
@@ -92,9 +93,18 @@ if __name__ == "__main__":
     model = WaveNet(input_channels, residual_channels, dilation_channels, skip_channels, kernel_size, num_classes, num_layers)
 
     # Path to audio file or directory
-    audio_path = r"C:\Users\lukas\Music\chopped_segments"
+    audio_path = r"C:\Users\lukas\Music\youtube_wav_files"
+    # Define base directories for saving files
+    base_dir = r"C:\Users\lukas\Music\wavenet"
+    audio_dir = os.path.join(base_dir, "audio")
+    model_dir = os.path.join(base_dir, "model")
+    loss_dir = os.path.join(base_dir, "loss")
 
-    # Initialize dataset and dataloader
+    # Create directories if they don't exist
+    os.makedirs(audio_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(loss_dir, exist_ok=True)
+        # Initialize dataset and dataloader
     sequence_length = 16000*4*3  # 1 second of audio at 16kHz
     batch_size = 8
     dataset = WaveNetDataset(audio_path, sequence_length, num_classes)
@@ -157,7 +167,8 @@ if __name__ == "__main__":
             progress_bar.set_postfix(loss=loss.item())
             if step % 1 == 0:
                 step_losses.append(loss.item())
-            # Save audio every 500 steps
+
+            # Save audio every 200 steps
             if step % 200 == 0:
                 # Reshape outputs back to [batch_size, sequence_length, num_classes]
                 outputs = outputs.view(batch_size, -1, num_classes)  # Restore original shape
@@ -170,20 +181,32 @@ if __name__ == "__main__":
                 print(f"Decoded audio shape: {predicted_audio.shape}")
 
                 # Save the decoded audio as a WAV file
-                audio_path = f"no_soft_piano_generated_audio_step_{step}.wav"
+                audio_path = os.path.join(audio_dir, f"generated_audio_step_{step}.wav")
                 write(audio_path, 16000, predicted_audio.astype(np.float32))  # Save as 32-bit float WAV
                 print(f"Saved decoded audio at step {step}: {audio_path}")
-                    # Plot the loss graph
+
+                # Plot the loss graph
                 plt.figure(figsize=(10, 6))
                 plt.plot(range(1, len(step_losses) + 1), step_losses, marker='o', label='Training Loss')
-                plt.xlabel('Steps (x10)')
+                plt.xlabel('Steps')
                 plt.ylabel('Loss')
-                plt.title('Training Loss Over Epochs')
+                plt.title('Training Loss Over Steps')
                 plt.legend()
                 plt.grid()
-                plt.savefig(f"training_loss_step_{step}.png")  # Save as PNG file
-                #plt.show()  # Show the plot after saving    
+
+                # Save the loss graph
+                loss_path = os.path.join(loss_dir, f"training_loss_step_{step}.png")
+                plt.savefig(loss_path)  # Save as PNG file
+                print(f"Saved loss graph at step {step}: {loss_path}")
+                # plt.show()  # Show the plot after saving
+
+            # Save the model every 500 steps
+            if step % 500 == 0:
+                model_save_path = os.path.join(model_dir, f"wavenet_model_step_{step}.pth")
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Model saved at step {step}: {model_save_path}")
+
             step += 1  # Increment step counter
 
-        # Print epoch loss
+            # Print epoch loss
         print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
