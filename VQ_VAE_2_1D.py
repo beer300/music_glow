@@ -319,3 +319,181 @@ class VQVAE2_1D(nn.Module):
         return self.decode(z_q_b, z_q_t)
 
 
+def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=100, gradient_clip_val=None):
+    model.train()  
+    total_loss_epoch = 0.0
+    recon_loss_epoch = 0.0
+    vq_loss_epoch = 0.0
+    num_batches = len(train_loader)
+    sample_recon = None  
+
+    if num_batches == 0:
+        print("Warning: DataLoader is empty. Skipping training for this epoch.")
+        return {'total_loss': 0.0, 'recon_loss': 0.0, 'vq_loss': 0.0}, None
+
+    start_time = time.time()
+
+
+    with tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch") as progress_bar:
+        for batch_idx, data in enumerate(progress_bar):
+            data = data.to(device) 
+
+
+            optimizer.zero_grad()  
+            x_recon, total_loss, recon_loss, vq_loss = model(data)
+
+
+            total_loss.backward()
+
+
+            if gradient_clip_val is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
+
+            optimizer.step()  
+
+
+            total_loss_epoch += total_loss.item()
+            recon_loss_epoch += recon_loss.item()
+            vq_loss_epoch += vq_loss.item()
+
+
+            if batch_idx == num_batches - 1:
+                sample_recon = x_recon[0].detach().cpu().numpy() 
+
+
+            progress_bar.set_postfix({
+                "Total Loss": total_loss.item(),
+                "Recon Loss": recon_loss.item(),
+                "VQ Loss": vq_loss.item()
+            })
+
+
+    avg_total_loss = total_loss_epoch / num_batches
+    avg_recon_loss = recon_loss_epoch / num_batches
+    avg_vq_loss = vq_loss_epoch / num_batches
+
+    epoch_time = time.time() - start_time
+    print(f'====> Epoch: {epoch} Completed \t'
+          f'Average Total Loss: {avg_total_loss:.4f} (Recon: {avg_recon_loss:.4f}, VQ: {avg_vq_loss:.4f})\t'
+          f'Time: {epoch_time:.2f}s')
+
+    return {
+        'total_loss': avg_total_loss,
+        'recon_loss': avg_recon_loss,
+        'vq_loss': avg_vq_loss
+    }, sample_recon
+
+if __name__ == '__main__':
+
+    DUMMY_DATA_DIR = r"C:\Users\lukas\Music\youtube_playlist_chopped" 
+    if not os.path.exists(DUMMY_DATA_DIR) or not os.listdir(DUMMY_DATA_DIR):
+        print("Dummy data directory is missing or empty.")
+        print("Please run the DataLoader script first to generate dummy data, or point to your own dataset.")
+        exit() # Or call the data generation code here
+
+
+    LEARNING_RATE = 1e-4
+    NUM_EPOCHS = 20 # Set a small number for demonstration
+    BATCH_SIZE = 16
+    TARGET_SEQ_LENGTH = 64000 # Must match DataLoader and be compatible with model
+    LOG_INTERVAL = 10     # Print progress every 10 batches
+    SAVE_INTERVAL = 2      # Save model every 2 epochs
+    GRADIENT_CLIP = 1.0    
+    CHECKPOINT_DIR = './vqvae1d_checkpoints'
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    if not os.path.exists(CHECKPOINT_DIR):
+        os.makedirs(CHECKPOINT_DIR)
+        print(f"Created checkpoint directory: {CHECKPOINT_DIR}")
+
+
+    model = VQVAE2_1D(
+        in_channels=1, out_channels=1, hidden_channels=128, res_channels=64,
+        num_res_blocks=2, num_embeddings=512, embedding_dim=64,
+        commitment_cost=0.25, downsample_factor=2, num_downsample_layers_top=2
+    ).to(device)
+    print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters.")
+
+
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+
+    train_loader = create_dataloader(
+        data_dir=DUMMY_DATA_DIR,
+        sequence_length=TARGET_SEQ_LENGTH,
+        batch_size=BATCH_SIZE,
+        channels=1,
+        file_extension='.wav',
+        target_sample_rate=16000, 
+        num_workers=2,
+        shuffle=True
+    )
+
+    print("\nStarting Training...")
+    all_train_losses = []
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        epoch_losses, sample_recon = train_vqvae_1d(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            log_interval=LOG_INTERVAL,
+            gradient_clip_val=GRADIENT_CLIP
+        )
+        all_train_losses.append(epoch_losses)
+
+
+        if epoch % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS:
+            checkpoint_path = os.path.join(CHECKPOINT_DIR, f'vqvae1d_epoch_{epoch}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': epoch_losses,  # Save last epoch's average loss
+            }, checkpoint_path)
+            print(f"====> Saved checkpoint to {checkpoint_path}")
+
+
+        if sample_recon is not None:
+
+            sample_recon = sample_recon.squeeze()  
+            sample_recon = (sample_recon - sample_recon.min()) / (sample_recon.max() - sample_recon.min())  
+            sample_recon = 2 * sample_recon - 1 
+
+            
+            audio_path = os.path.join(CHECKPOINT_DIR, f'reconstruction_epoch_{epoch}.wav')
+            write(audio_path, 16000, (sample_recon * 32767).astype('int16'))  
+            print(f"====> Saved reconstructed audio to {audio_path}")
+
+
+    print("\nTraining Finished.")
+
+
+    try:
+        import matplotlib.pyplot as plt
+
+        epochs_range = range(1, NUM_EPOCHS + 1)
+        total_losses = [l['total_loss'] for l in all_train_losses]
+        recon_losses = [l['recon_loss'] for l in all_train_losses]
+        vq_losses = [l['vq_loss'] for l in all_train_losses]
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(epochs_range, total_losses, label='Total Loss')
+        plt.plot(epochs_range, recon_losses, label='Reconstruction Loss', linestyle='--')
+        plt.plot(epochs_range, vq_losses, label='VQ Loss', linestyle=':')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Losses')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(CHECKPOINT_DIR, 'training_losses.png'))
+        print(f"Saved training loss plot to {os.path.join(CHECKPOINT_DIR, 'training_losses.png')}")
+
+
+    except ImportError:
+        print("\nmatplotlib not found. Skipping loss plot generation.")
+        print("Install it with: pip install matplotlib")
