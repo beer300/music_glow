@@ -232,3 +232,90 @@ class Decoder1D(nn.Module):
 
 
 
+class VQVAE2_1D(nn.Module):
+
+    def __init__(self,
+                 in_channels=1,
+                 out_channels=1,
+                 hidden_channels=128,
+                 res_channels=64,
+                 num_res_blocks=2,
+                 num_embeddings=512,
+                 embedding_dim=64,
+                 commitment_cost=0.25,
+                 downsample_factor=2,
+                 num_downsample_layers_top=2,
+                 decay=0.99): # Decay is for potential EMA updates
+        super().__init__()
+
+        self.encoder = Encoder1D(in_channels, hidden_channels, num_res_blocks, res_channels,
+                                 downsample_factor, num_downsample_layers_top)
+
+        # Projection layers to ensure encoder outputs match embedding_dim
+        self.pre_vq_conv_b = nn.Conv1d(hidden_channels, embedding_dim, kernel_size=1, stride=1)
+        
+        self.pre_vq_conv_t = nn.Conv1d(hidden_channels, embedding_dim, kernel_size=1, stride=1)
+
+        # Vector Quantizer layers (shared class works for 1D)
+        self.vq_b = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
+        self.vq_t = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
+
+        self.decoder = Decoder1D(out_channels, hidden_channels, num_res_blocks, res_channels, embedding_dim,
+                                 upsample_factor=downsample_factor, # Match encoder
+                                 num_upsample_layers_top=num_downsample_layers_top) # Match encoder
+
+    def forward(self, x):
+        # Encode
+        z_b_pre_vq, z_t_pre_vq = self.encoder(x)
+
+
+        z_b_pre_vq = self.pre_vq_conv_b(z_b_pre_vq)
+        z_t_pre_vq = self.pre_vq_conv_t(z_t_pre_vq)
+
+        # Quantize
+        z_q_b, vq_loss_b, _ = self.vq_b(z_b_pre_vq)
+        z_q_t, vq_loss_t, _ = self.vq_t(z_t_pre_vq)
+
+        # Decode
+        x_recon = self.decoder(z_q_b, z_q_t)
+
+        # Calculate reconstruction loss
+        recon_loss = F.mse_loss(x_recon, x)
+
+        # Combine VQ losses (including commitment loss)
+        total_vq_loss = vq_loss_b + vq_loss_t
+
+        # Total loss includes reconstruction loss and VQ loss
+        total_loss = recon_loss + total_vq_loss
+
+        # Ensure reconstruction has the same length as input
+        if x_recon.shape[2] != x.shape[2]:
+            x_recon = F.interpolate(x_recon, size=x.shape[2], mode='linear', align_corners=False)
+
+        return x_recon, total_loss, recon_loss, total_vq_loss
+
+    def encode(self, x):
+
+        z_b_pre_vq, z_t_pre_vq = self.encoder(x)
+        z_b_pre_vq = self.pre_vq_conv_b(z_b_pre_vq)
+        z_t_pre_vq = self.pre_vq_conv_t(z_t_pre_vq)
+
+        z_q_b, _, indices_b = self.vq_b(z_b_pre_vq)
+        z_q_t, _, indices_t = self.vq_t(z_t_pre_vq)
+
+        return z_q_b, z_q_t, indices_b, indices_t
+
+    def decode(self, z_q_b, z_q_t):
+
+        x_recon = self.decoder(z_q_b, z_q_t)
+
+        return x_recon
+
+
+    def decode_from_indices(self, indices_b, indices_t):
+
+        z_q_b = self.vq_b.get_codebook_entry(indices_b)
+        z_q_t = self.vq_t.get_codebook_entry(indices_t)
+        return self.decode(z_q_b, z_q_t)
+
+
