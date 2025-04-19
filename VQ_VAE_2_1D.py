@@ -170,3 +170,65 @@ class Encoder1D(nn.Module):
 
 
 
+class Decoder1D(nn.Module):
+
+    def __init__(self, out_channels, hidden_channels, num_res_blocks, res_channels, embedding_dim, upsample_factor=2, num_upsample_layers_top=2):
+        super().__init__()
+        ks = upsample_factor * 2 # Kernel size for transpose conv
+
+
+        top_layers = []
+
+        top_layers.append(nn.Conv1d(embedding_dim, hidden_channels, kernel_size=3, stride=1, padding=1))
+
+        for _ in range(num_res_blocks):
+            top_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+
+
+        current_channels = hidden_channels
+        for i in range(num_upsample_layers_top):
+             out_ch = hidden_channels # Keep hidden_channels for simplicity
+             top_layers.append(nn.ConvTranspose1d(current_channels, out_ch, kernel_size=ks, stride=upsample_factor, padding=ks//2 - upsample_factor//2))
+             if i < num_upsample_layers_top - 1: # Don't apply final ReLU before concatenation
+                 top_layers.append(nn.ReLU(inplace=True))
+             current_channels = out_ch
+
+        self.decoder_t = nn.Sequential(*top_layers)
+
+        bottom_layers = []
+        # Input channels = bottom embedding dim + hidden channels from processed top latent
+        bottom_layers.append(nn.Conv1d(embedding_dim + hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1))
+        # Residual Blocks
+        for _ in range(num_res_blocks):
+            bottom_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+
+        # Upsample back to original image resolution (two initial upsamples corresponding to encoder)
+        bottom_layers.append(nn.ConvTranspose1d(hidden_channels, hidden_channels // 2, kernel_size=ks, stride=upsample_factor, padding=ks//2 - upsample_factor//2))
+        bottom_layers.append(nn.ReLU(inplace=True))
+        bottom_layers.append(nn.ConvTranspose1d(hidden_channels // 2, out_channels, kernel_size=ks, stride=upsample_factor, padding=ks//2 - upsample_factor//2))
+        # Potentially add a final activation like Tanh if data is normalized to [-1, 1]
+
+        self.decoder_b = nn.Sequential(*bottom_layers)
+
+    def forward(self, z_q_b, z_q_t):
+        #print(f"Decoder1D bottom latent shape: {z_q_b.shape}")
+        #print(f"Decoder1D top latent shape: {z_q_t.shape}")
+        decoded_t = self.decoder_t(z_q_t) # Shape: (B, HiddenCh, L_b)
+        #print(f"Decoder1D top decoded shape: {decoded_t.shape}")
+
+        # Ensure sequence lengths match before concatenation
+        if decoded_t.shape[2] != z_q_b.shape[2]:
+             target_len = z_q_b.shape[2]
+             decoded_t = F.interpolate(decoded_t, size=target_len, mode='nearest') # Use 'linear' or 'nearest'
+
+        # Concatenate bottom latents and upsampled top latents along channel dimension
+        combined = torch.cat([z_q_b, decoded_t], dim=1) # Shape: (B, EmbDim + HiddenCh, L_b)
+        #print(f"Decoder1D combined shape: {combined.shape}")
+
+        # Decode combined latents
+        reconstructed_x = self.decoder_b(combined) # Shape: (B, OutCh, L_original)
+
+        return reconstructed_x
+
+
+
