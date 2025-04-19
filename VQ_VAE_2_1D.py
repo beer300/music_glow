@@ -117,3 +117,56 @@ class VectorQuantizer(nn.Module):
 
 
 
+
+class Encoder1D(nn.Module):
+
+    def __init__(self, in_channels, hidden_channels, num_res_blocks, res_channels, downsample_factor=2, num_downsample_layers_top=2):
+        super().__init__()
+        ks = downsample_factor * 2 # Kernel size often related to stride
+
+        # --- Bottom Level Encoder ---
+        bottom_layers = []
+        # Initial downsampling (e.g., by 4 if downsample_factor=2, done twice)
+        bottom_layers.append(nn.Conv1d(in_channels, hidden_channels // 2, kernel_size=ks, stride=downsample_factor, padding=ks//2 - downsample_factor//2)) # Halve length
+        bottom_layers.append(nn.ReLU(inplace=True))
+        bottom_layers.append(nn.Conv1d(hidden_channels // 2, hidden_channels, kernel_size=ks, stride=downsample_factor, padding=ks//2 - downsample_factor//2)) # Halve length again
+        bottom_layers.append(nn.ReLU(inplace=True))
+        bottom_layers.append(nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1)) # Adjust channels
+
+        # Residual Blocks
+        for _ in range(num_res_blocks):
+            bottom_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+        bottom_layers.append(nn.ReLU(inplace=True)) # Activation before VQ projection
+        self.encoder_b = nn.Sequential(*bottom_layers)
+
+        # --- Top Level Encoder ---
+        top_layers = []
+        # Takes output of bottom encoder as input
+        # Downsample further based on `num_downsample_layers_top`
+        current_channels = hidden_channels
+        for i in range(num_downsample_layers_top):
+            out_ch = hidden_channels # Keep hidden_channels for simplicity, could change
+            top_layers.append(nn.Conv1d(current_channels, out_ch, kernel_size=ks, stride=downsample_factor, padding=ks//2 - downsample_factor//2))
+            top_layers.append(nn.ReLU(inplace=True))
+            print(f"Encoder1D top layer {i} output channels: {out_ch}")
+            current_channels = out_ch
+
+        top_layers.append(nn.Conv1d(current_channels, hidden_channels, kernel_size=3, stride=1, padding=1)) # Adjust channels before ResBlocks
+
+        # Residual Blocks
+        for _ in range(num_res_blocks):
+            top_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+        top_layers.append(nn.ReLU(inplace=True)) # Activation before VQ projection
+        self.encoder_t = nn.Sequential(*top_layers)
+
+
+    def forward(self, x):
+
+        encoded_b = self.encoder_b(x) 
+
+        encoded_t = self.encoder_t(encoded_b) 
+
+        return encoded_b, encoded_t 
+
+
+
