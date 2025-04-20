@@ -5,22 +5,25 @@ import torch.nn.functional as F
 import math
 import torch.optim as optim  # Import optimizer
 import random  # Import random for seed setting
-
+from torch.amp import GradScaler, autocast
 import time
 from tqdm import tqdm 
 import VQ_VAE_2_1D_data 
 from VQ_VAE_2_1D_data import create_dataloader
 from scipy.io.wavfile import write  # For saving audio
+from torch.optim.lr_scheduler import LambdaLR 
+import matplotlib.pyplot as plt
+
 class ResidualBlock1D(nn.Module):
 
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+    def __init__(self, in_channels, out_channels, mid_channels=None, dropout_prob=0.2):  # Add dropout_prob
         super().__init__()
         if mid_channels is None:
             mid_channels = out_channels
 
         self.conv1 = nn.Conv1d(in_channels, mid_channels, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv1d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0) # 1x1 equivalent
-
+        self.conv2 = nn.Conv1d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0)  # 1x1 equivalent
+        self.dropout = nn.Dropout(dropout_prob)  # Add dropout layer
 
         if in_channels != out_channels:
             self.skip = nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1)
@@ -28,13 +31,12 @@ class ResidualBlock1D(nn.Module):
             self.skip = nn.Identity()
 
     def forward(self, x):
-        #print(f"ResidualBlock1D input shape: {x.shape}")
         residual = self.skip(x)
         out = F.relu(x)
         out = F.relu(self.conv1(out))
+        out = self.dropout(out)  # Apply dropout
         out = self.conv2(out)
         out = out + residual
-        #print(f"ResidualBlock1D output shape: {out.shape}")
         return out
 
 
@@ -51,9 +53,7 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
 
     def forward(self, inputs):
-        #print(f"VectorQuantizer input shape: {inputs.shape}")
-        # Input shape: (B, C, L) for 1D or (B, C, H, W) for 2D
-        # Ensure C == embedding_dim
+
         input_dims = len(inputs.shape)
         if input_dims == 3: # 1D case (B, C, L)
             # Permute to (B, L, C)
@@ -65,21 +65,16 @@ class VectorQuantizer(nn.Module):
             raise ValueError(f"Input tensor dimensions {input_dims} not supported (expected 3 or 4).")
 
         input_shape = inputs_permuted.shape
-        # Flatten input to (B*L or B*H*W, C)
-        #print(f"VectorQuantizer permuted input shape: {inputs_permuted.shape}")
+
         flat_input = inputs_permuted.view(-1, self.embedding_dim)
-        #print(f"VectorQuantizer flat input shape: {flat_input.shape}")
-        # Calculate distances
+
         distances = (torch.sum(flat_input**2, dim=1, keepdim=True)
                      + torch.sum(self.embedding.weight**2, dim=1)
                      - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
-        #print(f"VectorQuantizer distances shape: {distances.shape}")
-        # Find the closest embedding vector indices
-        # shape: (B*L,) or (B*H*W,)
+
         encoding_indices = torch.argmin(distances, dim=1)
-        #print(f"VectorQuantizer encoding indices shape: {encoding_indices.shape}")
-        # Quantize
-        quantized = self.embedding(encoding_indices) # Shape: (B*L, C) or (B*H*W, C)
+
+        quantized = self.embedding(encoding_indices) 
         #print(f"VectorQuantizer quantized shape: {quantized.shape}")
         quantized = quantized.view(input_shape) # Reshape back to (B, L, C) or (B, H, W, C)
         #print(f"VectorQuantizer reshaped quantized shape: {quantized.shape}")
@@ -128,7 +123,7 @@ class VectorQuantizer(nn.Module):
 
 class Encoder1D(nn.Module):
 
-    def __init__(self, in_channels, hidden_channels, num_res_blocks, res_channels, downsample_factor=2, num_downsample_layers_top=2):
+    def __init__(self, in_channels, hidden_channels, num_res_blocks, res_channels, downsample_factor=2, num_downsample_layers_top=2, dropout_prob=0.2):  # Add dropout_prob
         super().__init__()
         ks = downsample_factor * 2  # Kernel size often related to stride
 
@@ -136,12 +131,14 @@ class Encoder1D(nn.Module):
         bottom_layers = []
         bottom_layers.append(nn.Conv1d(in_channels, hidden_channels // 2, kernel_size=ks, stride=downsample_factor, padding=ks // 2 - downsample_factor // 2))  # Halve length
         bottom_layers.append(nn.ReLU(inplace=True))
+        bottom_layers.append(nn.Dropout(dropout_prob))  # Add dropout
         bottom_layers.append(nn.Conv1d(hidden_channels // 2, hidden_channels, kernel_size=ks, stride=downsample_factor, padding=ks // 2 - downsample_factor // 2))  # Halve length again
         bottom_layers.append(nn.ReLU(inplace=True))
+        bottom_layers.append(nn.Dropout(dropout_prob))  # Add dropout
         bottom_layers.append(nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1))  # Adjust channels
 
         for _ in range(num_res_blocks):
-            bottom_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+            bottom_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels, dropout_prob))  # Pass dropout_prob
         bottom_layers.append(nn.ReLU(inplace=True))  # Activation before VQ projection
         self.encoder_b = nn.Sequential(*bottom_layers)
 
@@ -149,7 +146,7 @@ class Encoder1D(nn.Module):
         medium_layers = []
         medium_layers.append(nn.Conv1d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1))  # Adjust channels
         for _ in range(num_res_blocks):
-            medium_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+            medium_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels, dropout_prob))  # Pass dropout_prob
         medium_layers.append(nn.ReLU(inplace=True))  # Activation before passing to top encoder
         self.encoder_m = nn.Sequential(*medium_layers)
 
@@ -160,11 +157,12 @@ class Encoder1D(nn.Module):
             out_ch = hidden_channels  # Keep hidden_channels for simplicity
             top_layers.append(nn.Conv1d(current_channels, out_ch, kernel_size=ks, stride=downsample_factor, padding=ks // 2 - downsample_factor // 2))
             top_layers.append(nn.ReLU(inplace=True))
+            top_layers.append(nn.Dropout(dropout_prob))  # Add dropout
             current_channels = out_ch
 
         top_layers.append(nn.Conv1d(current_channels, hidden_channels, kernel_size=3, stride=1, padding=1))  # Adjust channels before ResBlocks
         for _ in range(num_res_blocks):
-            top_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+            top_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels, dropout_prob))  # Pass dropout_prob
         top_layers.append(nn.ReLU(inplace=True))  # Activation before VQ projection
         self.encoder_t = nn.Sequential(*top_layers)
 
@@ -183,7 +181,7 @@ class Encoder1D(nn.Module):
 
 class Decoder1D(nn.Module):
 
-    def __init__(self, out_channels, hidden_channels, num_res_blocks, res_channels, embedding_dim, upsample_factor=2, num_upsample_layers_top=2):
+    def __init__(self, out_channels, hidden_channels, num_res_blocks, res_channels, embedding_dim, upsample_factor=2, num_upsample_layers_top=2, dropout_prob=0.2):  # Add dropout_prob
         super().__init__()
         ks = upsample_factor * 2  # Kernel size for transpose conv
 
@@ -191,7 +189,7 @@ class Decoder1D(nn.Module):
         top_layers = []
         top_layers.append(nn.Conv1d(embedding_dim, hidden_channels, kernel_size=3, stride=1, padding=1))
         for _ in range(num_res_blocks):
-            top_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+            top_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels, dropout_prob))  # Pass dropout_prob
 
         current_channels = hidden_channels
         for i in range(num_upsample_layers_top):
@@ -199,6 +197,7 @@ class Decoder1D(nn.Module):
             top_layers.append(nn.ConvTranspose1d(current_channels, out_ch, kernel_size=ks, stride=upsample_factor, padding=ks // 2 - upsample_factor // 2))
             if i < num_upsample_layers_top - 1:  # Don't apply final ReLU before concatenation
                 top_layers.append(nn.ReLU(inplace=True))
+                top_layers.append(nn.Dropout(dropout_prob))  # Add dropout
             current_channels = out_ch
 
         self.decoder_t = nn.Sequential(*top_layers)
@@ -207,7 +206,7 @@ class Decoder1D(nn.Module):
         medium_layers = []
         medium_layers.append(nn.Conv1d(embedding_dim, hidden_channels, kernel_size=3, stride=1, padding=1))
         for _ in range(num_res_blocks):
-            medium_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+            medium_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels, dropout_prob))  # Pass dropout_prob
         self.decoder_m = nn.Sequential(*medium_layers)
 
         # --- Bottom Decoder ---
@@ -215,7 +214,7 @@ class Decoder1D(nn.Module):
         # Input channels = bottom embedding dim + hidden channels from processed top and medium latents
         bottom_layers.append(nn.Conv1d(embedding_dim + 2 * hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1))
         for _ in range(num_res_blocks):
-            bottom_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels))
+            bottom_layers.append(ResidualBlock1D(hidden_channels, hidden_channels, res_channels, dropout_prob))  # Pass dropout_prob
 
         # Upsample back to original resolution
         bottom_layers.append(nn.ConvTranspose1d(hidden_channels, hidden_channels // 2, kernel_size=ks, stride=upsample_factor, padding=ks // 2 - upsample_factor // 2))
@@ -247,22 +246,26 @@ class Decoder1D(nn.Module):
 
         return reconstructed_x
 class SpectralLoss(nn.Module):
-    def __init__(self, n_fft=1024):
+    def __init__(self, fft_sizes=[512, 1024, 2048]):
         super().__init__()
-        self.n_fft = n_fft
+        self.fft_sizes = fft_sizes
 
     def forward(self, x, x_hat):
         # Ensure input tensors are 2D: [batch_size, sequence_length]
         x = x.squeeze(1)  # Remove the channel dimension if it exists
         x_hat = x_hat.squeeze(1)
 
-        # Compute STFT
-        X = torch.stft(x, self.n_fft, return_complex=True).abs()
-        X_hat = torch.stft(x_hat, self.n_fft, return_complex=True).abs()
+        loss = 0
+        for n_fft in self.fft_sizes:
+            # Compute STFT
+            X = torch.stft(x, n_fft, return_complex=True).abs()
+            X_hat = torch.stft(x_hat, n_fft, return_complex=True).abs()
 
-        # Compute L1 loss
-        return F.l1_loss(X_hat, X)
+            # Compute L1 loss for this FFT size
+            loss += F.l1_loss(X_hat, X)
 
+        # Average the loss across all FFT sizes
+        return loss / len(self.fft_sizes)
 class VQVAE2_1D(nn.Module):
 
     def __init__(self,
@@ -272,15 +275,16 @@ class VQVAE2_1D(nn.Module):
                  res_channels=64,
                  num_res_blocks=2,
                  num_embeddings=512,
-                 embedding_dim=64,
+                 embedding_dim=256,
                  commitment_cost=0.25,
                  downsample_factor=2,
                  num_downsample_layers_top=2,
-                 decay=0.99): # Decay is for potential EMA updates
+                 decay=0.99,
+                 dropout_prob=0.2):  # Add dropout_prob
         super().__init__()
 
         self.encoder = Encoder1D(in_channels, hidden_channels, num_res_blocks, res_channels,
-                                 downsample_factor, num_downsample_layers_top)
+                                 downsample_factor, num_downsample_layers_top, dropout_prob)  # Pass dropout_prob
 
         # Projection layers to ensure encoder outputs match embedding_dim
         self.pre_vq_conv_b = nn.Conv1d(hidden_channels, embedding_dim, kernel_size=1, stride=1)
@@ -293,9 +297,9 @@ class VQVAE2_1D(nn.Module):
         self.vq_t = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
 
         self.decoder = Decoder1D(out_channels, hidden_channels, num_res_blocks, res_channels, embedding_dim,
-                                 upsample_factor=downsample_factor, # Match encoder
-                                 num_upsample_layers_top=num_downsample_layers_top) # Match encoder
-        self.spectral_loss_fn = SpectralLoss(n_fft=1024)  # Initialize spectral loss
+                                 upsample_factor=downsample_factor,  # Match encoder
+                                 num_upsample_layers_top=num_downsample_layers_top, dropout_prob=dropout_prob)  # Pass dropout_prob
+        self.spectral_loss_fn = SpectralLoss(fft_sizes=[512, 1024, 2048])
     def forward(self, x):
         # Encode
         z_b_pre_vq, z_m_pre_vq, z_t_pre_vq = self.encoder(x)
@@ -320,7 +324,7 @@ class VQVAE2_1D(nn.Module):
 
         # Spectral loss
         spectral_loss = self.spectral_loss_fn(x_recon, x)
-        spectral_loss= 0.5*spectral_loss  # Scale down the spectral loss
+        spectral_loss= 0.2*spectral_loss  # Scale down the spectral loss
         # Total loss
         total_loss = recon_loss + total_vq_loss + spectral_loss
 
@@ -370,14 +374,15 @@ def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=1
 
     start_time = time.time()
 
-
+    scaler = GradScaler("cuda")
     with tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch") as progress_bar:
         for batch_idx, data in enumerate(progress_bar):
             data = data.to(device) 
 
 
             optimizer.zero_grad()  
-            x_recon, total_loss, recon_loss, vq_loss, spectral_loss = model(data)
+            with autocast("cuda"):
+                x_recon, total_loss, recon_loss, vq_loss, spectral_loss = model(data)
 
 
             total_loss.backward()
@@ -430,11 +435,19 @@ def reset_unused_codes(vq_layer, threshold=0.1):
     with torch.no_grad():
         usage = vq_layer.embedding.weight.norm(dim=1)  # Compute norm as a proxy for usage
         unused = usage < threshold
+        print(f"Unused codes: {unused.sum().item()} out of {vq_layer.num_embeddings}")
         if unused.any():
             print(f"Resetting {unused.sum().item()} underused codes.")
             vq_layer.embedding.weight.data[unused] = torch.randn_like(vq_layer.embedding.weight[unused]) * 0.1
+def warmup_lr_scheduler(optimizer, warmup_epochs, total_epochs):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return epoch / warmup_epochs  # Linear warm-up
+        return 1.0  # Keep learning rate constant after warm-up
+    return LambdaLR(optimizer, lr_lambda)
 
 if __name__ == '__main__':
+
 
     # Set random seed for reproducibility
     SEED = 42
@@ -452,14 +465,14 @@ if __name__ == '__main__':
 
 
     LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 40 # Set a small number for demonstration
-    BATCH_SIZE = 16
+    NUM_EPOCHS = 60 # Set a small number for demonstration
+    BATCH_SIZE = 4
     TARGET_SEQ_LENGTH = 64000 # Must match DataLoader and be compatible with model
     LOG_INTERVAL = 10     # Print progress every 10 batches
     SAVE_INTERVAL = 2      # Save model every 2 epochs
     GRADIENT_CLIP = 1.0    
-    CHECKPOINT_DIR = r"C:\Users\lukas\Music\VQ_VAE_2_FINAL_1D\spectral"
-
+    CHECKPOINT_DIR = r"C:\Users\lukas\Music\VQ_VAE_2_FINAL_1D\hierachy_spectral"
+    WEIGHT_DECAY = 1e-5
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -469,14 +482,14 @@ if __name__ == '__main__':
 
 
     model = VQVAE2_1D(
-        in_channels=1, out_channels=1, hidden_channels=128, res_channels=64,
-        num_res_blocks=2, num_embeddings=512, embedding_dim=64,
-        commitment_cost=0.25, downsample_factor=2, num_downsample_layers_top=2
+        in_channels=1, out_channels=1, hidden_channels=128, res_channels=256,
+        num_res_blocks=2, num_embeddings=512, embedding_dim=256,
+        commitment_cost=0.5, downsample_factor=2, num_downsample_layers_top=2
     ).to(device)
     print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters.")
 
 
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
 
     train_loader = create_dataloader(
@@ -492,7 +505,8 @@ if __name__ == '__main__':
 
     print("\nStarting Training...")
     all_train_losses = []
-
+    WARMUP_EPOCHS = 5  # Number of warm-up epochs
+    scheduler = warmup_lr_scheduler(optimizer, warmup_epochs=WARMUP_EPOCHS, total_epochs=NUM_EPOCHS)
     for epoch in range(1, NUM_EPOCHS + 1):
         epoch_losses, sample_recon = train_vqvae_1d(
             model=model,
@@ -504,7 +518,7 @@ if __name__ == '__main__':
             gradient_clip_val=GRADIENT_CLIP
         )
         all_train_losses.append(epoch_losses)
-
+        scheduler.step()  # Step the learning rate scheduler
         # Reset underused codes in vector quantizers
         reset_unused_codes(model.vq_b)
         reset_unused_codes(model.vq_m)
@@ -519,6 +533,29 @@ if __name__ == '__main__':
                 'loss': epoch_losses,  # Save last epoch's average loss
             }, checkpoint_path)
             print(f"====> Saved checkpoint to {checkpoint_path}")
+            try:
+                # Adjust epochs_range to match the length of all_train_losses
+                epochs_range = range(1, len(all_train_losses) + 1)
+                total_losses = [l['total_loss'] for l in all_train_losses]
+                recon_losses = [l['recon_loss'] for l in all_train_losses]
+                spectral_losses = [l['spectral_loss'] for l in all_train_losses]
+                vq_losses = [l['vq_loss'] for l in all_train_losses]
+
+                plt.figure(figsize=(10, 5))
+                plt.plot(epochs_range, total_losses, label='Total Loss')
+                plt.plot(epochs_range, recon_losses, label='Reconstruction Loss', linestyle='--')
+                plt.plot(epochs_range, vq_losses, label='VQ Loss', linestyle=':')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.title('Training Losses')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(CHECKPOINT_DIR, 'training_losses.png'))
+                print(f"Saved training loss plot to {os.path.join(CHECKPOINT_DIR, 'training_losses.png')}")
+
+            except ImportError:
+                print("\nmatplotlib not found. Skipping loss plot generation.")
+                print("Install it with: pip install matplotlib")
 
         if sample_recon is not None:
             sample_recon = sample_recon.squeeze()  
@@ -539,28 +576,3 @@ if __name__ == '__main__':
     print("\nTraining Finished.")
 
 
-    try:
-        import matplotlib.pyplot as plt
-
-        epochs_range = range(1, NUM_EPOCHS + 1)
-        total_losses = [l['total_loss'] for l in all_train_losses]
-        recon_losses = [l['recon_loss'] for l in all_train_losses]
-        spectral_losses = [l['spectral_loss'] for l in all_train_losses]
-        vq_losses = [l['vq_loss'] for l in all_train_losses]
-
-        plt.figure(figsize=(10, 5))
-        plt.plot(epochs_range, total_losses, label='Total Loss')
-        plt.plot(epochs_range, recon_losses, label='Reconstruction Loss', linestyle='--')
-        plt.plot(epochs_range, vq_losses, label='VQ Loss', linestyle=':')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Losses')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(CHECKPOINT_DIR, 'training_losses.png'))
-        print(f"Saved training loss plot to {os.path.join(CHECKPOINT_DIR, 'training_losses.png')}")
-
-
-    except ImportError:
-        print("\nmatplotlib not found. Skipping loss plot generation.")
-        print("Install it with: pip install matplotlib")
