@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,60 +54,67 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
 
     def forward(self, inputs):
-
         input_dims = len(inputs.shape)
-        if input_dims == 3: # 1D case (B, C, L)
-            # Permute to (B, L, C)
+        if input_dims == 3:  # 1D case (B, C, L)
             inputs_permuted = inputs.permute(0, 2, 1).contiguous()
-        elif input_dims == 4: # 2D case (B, C, H, W)
-             # Permute to (B, H, W, C)
-             inputs_permuted = inputs.permute(0, 2, 3, 1).contiguous()
+        elif input_dims == 4:  # 2D case (B, C, H, W)
+            inputs_permuted = inputs.permute(0, 2, 3, 1).contiguous()
         else:
             raise ValueError(f"Input tensor dimensions {input_dims} not supported (expected 3 or 4).")
 
         input_shape = inputs_permuted.shape
-
         flat_input = inputs_permuted.view(-1, self.embedding_dim)
 
         distances = (torch.sum(flat_input**2, dim=1, keepdim=True)
-                     + torch.sum(self.embedding.weight**2, dim=1)
-                     - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
+                    + torch.sum(self.embedding.weight**2, dim=1)
+                    - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
 
         encoding_indices = torch.argmin(distances, dim=1)
 
-        quantized = self.embedding(encoding_indices) 
-        #print(f"VectorQuantizer quantized shape: {quantized.shape}")
-        quantized = quantized.view(input_shape) # Reshape back to (B, L, C) or (B, H, W, C)
-        #print(f"VectorQuantizer reshaped quantized shape: {quantized.shape}")
-        # Loss Calculation
+        # Jukebox's codebook restart: Replace dead codes with encoder outputs
+        if self.training:
+            # Identify codes not used in the current batch
+            unique_indices = torch.unique(encoding_indices)
+            used_mask = torch.zeros(self.num_embeddings, device=encoding_indices.device, dtype=torch.bool)
+            used_mask[unique_indices] = True
+            dead_codes = ~used_mask
+
+            num_dead = dead_codes.sum().item()
+            if num_dead > 0:
+                rand_indices = torch.randint(0, flat_input.size(0), (num_dead,), device=flat_input.device)
+                replacement = flat_input[rand_indices].detach()
+                
+                # Convert replacement to FP32 to match embedding dtype
+                with torch.no_grad():
+                    self.embedding.weight.data[dead_codes] = replacement.float()  # <-- FIX HERE
+
+        quantized = self.embedding(encoding_indices)
+        quantized = quantized.view(input_shape)
+
         e_latent_loss = F.mse_loss(quantized.detach().view(flat_input.shape), flat_input)
         q_latent_loss = F.mse_loss(quantized.view(flat_input.shape), flat_input.detach())
         vq_loss = e_latent_loss + self.commitment_cost * q_latent_loss
-        #print(f"VectorQuantizer q_latent_loss shape: {q_latent_loss.shape}")
-        vq_loss = e_latent_loss + self.commitment_cost * q_latent_loss
-        #print(f"VectorQuantizer vq_loss shape: {vq_loss.shape}")
-        # Straight-Through Estimator
+
         quantized_st = inputs_permuted + (quantized - inputs_permuted).detach()
 
-        # Permute back to (B, C, L) or (B, C, H, W)
         if input_dims == 3:
-             quantized_st = quantized_st.permute(0, 2, 1).contiguous()
-             # indices shape: (B, L)
-             indices_reshaped = encoding_indices.view(input_shape[:-1])
-        else: # input_dims == 4
-             quantized_st = quantized_st.permute(0, 3, 1, 2).contiguous()
-             # indices shape: (B, H, W)
-             indices_reshaped = encoding_indices.view(input_shape[:-1])
+            quantized_st = quantized_st.permute(0, 2, 1).contiguous()
+            indices_reshaped = encoding_indices.view(input_shape[:-1])
+        else:
+            quantized_st = quantized_st.permute(0, 3, 1, 2).contiguous()
+            indices_reshaped = encoding_indices.view(input_shape[:-1])
 
-        #print(f"VectorQuantizer quantized shape: {quantized_st.shape}")
         return quantized_st, vq_loss, indices_reshaped
 
     def get_codebook_entry(self, indices):
         # indices shape: (B, L) or (B, H, W) or (N,)
+        #print(f"Indices shape: {indices.shape}")
         batch_size = indices.shape[0]
+        #print(f"Batch size: {batch_size}")
         indices_flatten = indices.reshape(-1) # (B*L,) or (B*H*W,) or (N,)
+        #print(f"Flattened indices shape: {indices_flatten.shape}")
         quantized = self.embedding(indices_flatten) # (B*L, C) or (B*H*W, C) or (N, C)
-
+        #print(f"Quantized shape: {quantized.shape}")
         # Reshape if needed
         if len(indices.shape) >= 2: # Multi-dimensional indices
             C = quantized.shape[-1]
@@ -116,7 +124,7 @@ class VectorQuantizer(nn.Module):
                 quantized = quantized.permute(0, 2, 1).contiguous()
             elif len(indices.shape) == 3: # 2D case (B, H, W) -> (B, H, W, C) -> (B, C, H, W)
                  quantized = quantized.permute(0, 3, 1, 2).contiguous()
-
+        #print(f"Final quantized shape: {quantized.shape}")
         return quantized
 
 
@@ -246,26 +254,38 @@ class Decoder1D(nn.Module):
 
         return reconstructed_x
 class SpectralLoss(nn.Module):
-    def __init__(self, fft_sizes=[512, 1024, 2048]):
+    def __init__(self, fft_sizes=[256, 512, 1024, 2048, 4096],  # More scales
+                 mag_weight=1.0, logmag_weight=0.5):
         super().__init__()
         self.fft_sizes = fft_sizes
+        self.mag_weight = mag_weight
+        self.logmag_weight = logmag_weight
 
     def forward(self, x, x_hat):
         # Ensure input tensors are 2D: [batch_size, sequence_length]
         x = x.squeeze(1)  # Remove the channel dimension if it exists
         x_hat = x_hat.squeeze(1)
 
-        loss = 0
+        mag_loss = 0
+        logmag_loss = 0
+
         for n_fft in self.fft_sizes:
             # Compute STFT
             X = torch.stft(x, n_fft, return_complex=True).abs()
             X_hat = torch.stft(x_hat, n_fft, return_complex=True).abs()
 
-            # Compute L1 loss for this FFT size
-            loss += F.l1_loss(X_hat, X)
+            # Compute magnitude loss
+            mag_loss += F.l1_loss(X_hat, X)
 
-        # Average the loss across all FFT sizes
-        return loss / len(self.fft_sizes)
+            # Compute log-magnitude loss
+            logmag_loss += F.l1_loss(torch.log(X_hat + 1e-7), torch.log(X + 1e-7))
+
+        # Average the losses across all FFT sizes
+        mag_loss /= len(self.fft_sizes)
+        logmag_loss /= len(self.fft_sizes)
+
+        # Combine magnitude and log-magnitude losses with weights
+        return mag_loss * self.mag_weight + logmag_loss * self.logmag_weight
 class VQVAE2_1D(nn.Module):
 
     def __init__(self,
@@ -282,7 +302,7 @@ class VQVAE2_1D(nn.Module):
                  decay=0.99,
                  dropout_prob=0.2):  # Add dropout_prob
         super().__init__()
-
+        self.num_embeddings = num_embeddings
         self.encoder = Encoder1D(in_channels, hidden_channels, num_res_blocks, res_channels,
                                  downsample_factor, num_downsample_layers_top, dropout_prob)  # Pass dropout_prob
 
@@ -300,6 +320,7 @@ class VQVAE2_1D(nn.Module):
                                  upsample_factor=downsample_factor,  # Match encoder
                                  num_upsample_layers_top=num_downsample_layers_top, dropout_prob=dropout_prob)  # Pass dropout_prob
         self.spectral_loss_fn = SpectralLoss(fft_sizes=[512, 1024, 2048])
+
     def forward(self, x):
         # Encode
         z_b_pre_vq, z_m_pre_vq, z_t_pre_vq = self.encoder(x)
@@ -309,12 +330,18 @@ class VQVAE2_1D(nn.Module):
         z_t_pre_vq = self.pre_vq_conv_t(z_t_pre_vq)
 
         # Quantize
-        z_q_b, vq_loss_b, _ = self.vq_b(z_b_pre_vq)
-        z_q_m, vq_loss_m, _ = self.vq_m(z_m_pre_vq)
-        z_q_t, vq_loss_t, _ = self.vq_t(z_t_pre_vq)
+        z_q_b, vq_loss_b, indices_b = self.vq_b(z_b_pre_vq)
+        z_q_m, vq_loss_m, indices_m = self.vq_m(z_m_pre_vq)
+        z_q_t, vq_loss_t, indices_t = self.vq_t(z_t_pre_vq)
 
         # Decode
         x_recon = self.decoder(z_q_b, z_q_m, z_q_t)
+
+        # Reconstruct audio from indices
+        x_recon_from_indices = self.reconstruct_from_indices(indices_b, indices_m, indices_t)
+        if x_recon.shape[2] != x.shape[2]:
+            x_recon = F.pad(x_recon, (0, x.shape[2] - x_recon.shape[2]))
+
 
         # Calculate reconstruction loss
         recon_loss = F.mse_loss(x_recon, x)
@@ -324,7 +351,8 @@ class VQVAE2_1D(nn.Module):
 
         # Spectral loss
         spectral_loss = self.spectral_loss_fn(x_recon, x)
-        spectral_loss= 0.2*spectral_loss  # Scale down the spectral loss
+        spectral_loss = 0.2 * spectral_loss  # Scale down the spectral loss
+
         # Total loss
         total_loss = recon_loss + total_vq_loss + spectral_loss
 
@@ -332,18 +360,41 @@ class VQVAE2_1D(nn.Module):
         if x_recon.shape[2] != x.shape[2]:
             x_recon = F.interpolate(x_recon, size=x.shape[2], mode='linear', align_corners=False)
 
-        return x_recon, total_loss, recon_loss, total_vq_loss, spectral_loss
+        return x_recon, x_recon_from_indices, total_loss, recon_loss, total_vq_loss, spectral_loss
+    def reconstruct_from_indices(self, indices_b, indices_m, indices_t):
+        """
+        Reconstruct audio from quantized indices.
 
+        Args:
+            indices_b (torch.Tensor): Indices for the bottom quantizer.
+            indices_m (torch.Tensor): Indices for the medium quantizer.
+            indices_t (torch.Tensor): Indices for the top quantizer.
+
+        Returns:
+            torch.Tensor: Reconstructed audio.
+        """
+        # Get quantized embeddings from indices
+        #print(f"Indices shapes: {indices_b.shape}, {indices_m.shape}, {indices_t.shape}")
+        z_q_b = self.vq_b.get_codebook_entry(indices_b)
+        z_q_m = self.vq_m.get_codebook_entry(indices_m)
+        z_q_t = self.vq_t.get_codebook_entry(indices_t)
+        #print(f"z_q_b shape: {z_q_b.shape}, z_q_m shape: {z_q_m.shape}, z_q_t shape: {z_q_t.shape}")
+        # Decode the quantized embeddings
+        reconstructed_audio = self.decoder(z_q_b, z_q_m, z_q_t)
+
+        return reconstructed_audio
     def encode(self, x):
         """ Encodes input x to quantized latents and indices. """
-        z_b_pre_vq, z_t_pre_vq = self.encoder(x)
+        z_b_pre_vq, z_m_pre_vq, z_t_pre_vq = self.encoder(x)
         z_b_pre_vq = self.pre_vq_conv_b(z_b_pre_vq)
+        z_m_pre_vq = self.pre_vq_conv_m(z_m_pre_vq)
         z_t_pre_vq = self.pre_vq_conv_t(z_t_pre_vq)
 
         z_q_b, _, indices_b = self.vq_b(z_b_pre_vq)
+        z_q_m, _, indices_m = self.vq_m(z_m_pre_vq)
         z_q_t, _, indices_t = self.vq_t(z_t_pre_vq)
 
-        return z_q_b, z_q_t, indices_b, indices_t
+        return z_q_b, z_q_m, z_q_t, indices_b, indices_m, indices_t
 
     def decode(self, z_q_b, z_q_t):
         """ Decodes quantized latents z_q_b and z_q_t into a sequence. """
@@ -352,11 +403,6 @@ class VQVAE2_1D(nn.Module):
         return x_recon
 
 
-    def decode_from_indices(self, indices_b, indices_t):
-        """ Decodes directly from codebook indices. """
-        z_q_b = self.vq_b.get_codebook_entry(indices_b)
-        z_q_t = self.vq_t.get_codebook_entry(indices_t)
-        return self.decode(z_q_b, z_q_t)
 
 
 def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=100, gradient_clip_val=None):
@@ -367,7 +413,7 @@ def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=1
     spectral_loss_epoch = 0.0
     num_batches = len(train_loader)
     sample_recon = None  
-
+    criterion = nn.CrossEntropyLoss()  # Cross-entropy loss for classification
     if num_batches == 0:
         print("Warning: DataLoader is empty. Skipping training for this epoch.")
         return {'total_loss': 0.0, 'recon_loss': 0.0, 'vq_loss': 0.0}, None
@@ -377,14 +423,15 @@ def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=1
     scaler = GradScaler("cuda")
     with tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch") as progress_bar:
         for batch_idx, data in enumerate(progress_bar):
-            data = data.to(device) 
+            data, _ = data
+            data = data.to(device, dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
 
 
             optimizer.zero_grad()  
             with autocast("cuda"):
-                x_recon, total_loss, recon_loss, vq_loss, spectral_loss = model(data)
+                xrecon_normal, x_recon, total_loss, recon_loss, vq_loss, spectral_loss = model(data)
 
-
+            
             total_loss.backward()
 
 
@@ -400,7 +447,8 @@ def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=1
             spectral_loss_epoch += spectral_loss.item()
 
             if batch_idx == num_batches - 1:
-                sample_recon = x_recon[0].detach().cpu().numpy() 
+                sample_input = data[0].detach().cpu().numpy()  # Capture input from last batch
+                sample_recon = x_recon[0].detach().cpu().numpy()
 
 
             progress_bar.set_postfix({
@@ -426,7 +474,7 @@ def train_vqvae_1d(model, train_loader, optimizer, device, epoch, log_interval=1
         'recon_loss': avg_recon_loss,
         'vq_loss': avg_vq_loss,
         'spectral_loss': avg_spectral_loss
-    }, sample_recon
+    }, sample_recon,sample_input
 
 def reset_unused_codes(vq_layer, threshold=0.1):
     """
@@ -457,9 +505,11 @@ if __name__ == '__main__':
         torch.cuda.manual_seed_all(SEED)
     print(f"Random seed set to {SEED}")
 
-    DUMMY_DATA_DIR = r"C:\Users\lukas\Music\youtube_playlist_chopped" 
-    if not os.path.exists(DUMMY_DATA_DIR) or not os.listdir(DUMMY_DATA_DIR):
-        print("Dummy data directory is missing or empty.")
+    DATA_DIR_1 = r"C:\Users\lukas\Documents\datasets\wavenet_dataset\input_audio" 
+    DATA_DIR_2 = r"C:\Users\lukas\Documents\datasets\wavenet_dataset\target_audio" 
+    
+    if not os.path.exists(DATA_DIR_1) or not os.listdir(DATA_DIR_1):
+        print(" data directory is missing or empty.")
         print("Please run the DataLoader script first to generate dummy data, or point to your own dataset.")
         exit() # Or call the data generation code here
 
@@ -467,11 +517,11 @@ if __name__ == '__main__':
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 60 # Set a small number for demonstration
     BATCH_SIZE = 4
-    TARGET_SEQ_LENGTH = 64000 # Must match DataLoader and be compatible with model
+    TARGET_SEQ_LENGTH = 16000*9 # Must match DataLoader and be compatible with model
     LOG_INTERVAL = 10     # Print progress every 10 batches
     SAVE_INTERVAL = 2      # Save model every 2 epochs
     GRADIENT_CLIP = 1.0    
-    CHECKPOINT_DIR = r"C:\Users\lukas\Music\VQ_VAE_2_FINAL_1D\hierachy_spectral"
+    CHECKPOINT_DIR = r"C:\Users\lukas\Music\VQ_VAE_2_FINAL_1D\indicies_33"
     WEIGHT_DECAY = 1e-5
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -484,21 +534,23 @@ if __name__ == '__main__':
     model = VQVAE2_1D(
         in_channels=1, out_channels=1, hidden_channels=128, res_channels=256,
         num_res_blocks=2, num_embeddings=512, embedding_dim=256,
-        commitment_cost=0.5, downsample_factor=2, num_downsample_layers_top=2
+        commitment_cost=1, downsample_factor=2, num_downsample_layers_top=3,
+        decay=0.95  # Zmniejszono decay
     ).to(device)
     print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters.")
 
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-
+    sample_rate = 16000  # Set the sample rate for your audio data
 
     train_loader = create_dataloader(
-        data_dir=DUMMY_DATA_DIR,
+        data_dir=DATA_DIR_1,
+        data_dir_2=DATA_DIR_2,
         sequence_length=TARGET_SEQ_LENGTH,
         batch_size=BATCH_SIZE,
         channels=1,
         file_extension='.wav',
-        target_sample_rate=16000, 
+        target_sample_rate=sample_rate, 
         num_workers=2,
         shuffle=True
     )
@@ -508,7 +560,7 @@ if __name__ == '__main__':
     WARMUP_EPOCHS = 5  # Number of warm-up epochs
     scheduler = warmup_lr_scheduler(optimizer, warmup_epochs=WARMUP_EPOCHS, total_epochs=NUM_EPOCHS)
     for epoch in range(1, NUM_EPOCHS + 1):
-        epoch_losses, sample_recon = train_vqvae_1d(
+        epoch_losses, sample_recon,sample_input = train_vqvae_1d(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -520,9 +572,9 @@ if __name__ == '__main__':
         all_train_losses.append(epoch_losses)
         scheduler.step()  # Step the learning rate scheduler
         # Reset underused codes in vector quantizers
-        reset_unused_codes(model.vq_b)
-        reset_unused_codes(model.vq_m)
-        reset_unused_codes(model.vq_t)
+        #reset_unused_codes(model.vq_b)
+        #reset_unused_codes(model.vq_m)
+        #reset_unused_codes(model.vq_t)
 
         if epoch % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS:
             checkpoint_path = os.path.join(CHECKPOINT_DIR, f'vqvae1d_epoch_{epoch}.pth')
@@ -544,6 +596,7 @@ if __name__ == '__main__':
                 plt.figure(figsize=(10, 5))
                 plt.plot(epochs_range, total_losses, label='Total Loss')
                 plt.plot(epochs_range, recon_losses, label='Reconstruction Loss', linestyle='--')
+                plt.plot(epochs_range, spectral_losses, label='Spectral Loss', linestyle='-.')
                 plt.plot(epochs_range, vq_losses, label='VQ Loss', linestyle=':')
                 plt.xlabel('Epoch')
                 plt.ylabel('Loss')
@@ -557,21 +610,21 @@ if __name__ == '__main__':
                 print("\nmatplotlib not found. Skipping loss plot generation.")
                 print("Install it with: pip install matplotlib")
 
-        if sample_recon is not None:
-            sample_recon = sample_recon.squeeze()  
-            sample_recon = (sample_recon - sample_recon.min()) / (sample_recon.max() - sample_recon.min())  
-            sample_recon = 2 * sample_recon - 1 
+        if sample_recon is not None and sample_input is not None:
+            # Save input audio
+            sample_input = sample_input.squeeze()  # Remove channel dimension
+            print(f"Sample input shape: {sample_input.shape}")
+            sample_input = np.clip(sample_input, -1.0, 1.0)  # Ensure within valid range
+            audio_path_input = os.path.join(CHECKPOINT_DIR, f'input_epoch_{epoch}.wav')
+            write(audio_path_input, sample_rate, (sample_input * 32767).astype('int16'))
+            print(f"====> Saved input audio to {audio_path_input}")
 
             # Save reconstructed audio
+            sample_recon = sample_recon.squeeze()  
+            sample_recon = np.clip(sample_recon, -1.0, 1.0)  # Clip to valid range
             audio_path_recon = os.path.join(CHECKPOINT_DIR, f'reconstruction_epoch_{epoch}.wav')
-            write(audio_path_recon, 16000, (sample_recon * 32767).astype('int16'))  
+            write(audio_path_recon, sample_rate, (sample_recon * 32767).astype('int16'))  
             print(f"====> Saved reconstructed audio to {audio_path_recon}")
-
-            # Save input audio
-            sample_input = train_loader.dataset[0].squeeze().numpy()  # Assuming the dataset has a __getitem__ method
-            audio_path_input = os.path.join(CHECKPOINT_DIR, f'input_epoch_{epoch}.wav')
-            write(audio_path_input, 16000, (sample_input * 32767).astype('int16'))
-            print(f"====> Saved input audio to {audio_path_input}")
 
     print("\nTraining Finished.")
 
