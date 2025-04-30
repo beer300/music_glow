@@ -5,9 +5,12 @@ import librosa
 from torch.utils.data import Dataset, DataLoader
 from packaging import version
 import soundfile
+from pydub import AudioSegment
+import tempfile
 N_FFT = 2048  # Define the FFT size
 TARGET_DURATION = 8  # Target duration in seconds
-
+#([8, 64, 256, 646])
+#([8, 64, 256, 172])
 def wav2spectrum(filename, target_duration=TARGET_DURATION):
     """
     Convert a WAV file to its spectrogram representation, ensuring it is exactly `target_duration` seconds long.
@@ -29,7 +32,7 @@ def wav2spectrum(filename, target_duration=TARGET_DURATION):
         x = x[:target_length]  # Trim to target length
     elif len(x) < target_length:
         x = np.pad(x, (0, target_length - len(x)), mode='constant')  # Pad with zeros
-    print(f"sr: {sr}, x.shape: {x.shape}, target_length: {target_length}")
+    #print(f"sr: {sr}, x.shape: {x.shape}, target_length: {target_length}")
     # Compute the spectrogram
     S = librosa.stft(x, n_fft=N_FFT)
     S = np.log1p(np.abs(S))  # Log-scaled magnitude
@@ -61,10 +64,18 @@ class WavDataset(Dataset):
         self.data_path = data_path
         self.filenames = [f for f in os.listdir(data_path) if f.endswith('.wav')]
         self.transform = transform
-
+        self.temp_dir = tempfile.mkdtemp()  # Create temporary directory for WAV conversions
     def __len__(self):
         return len(self.filenames)
-
+    
+    def convert_mp3_to_wav(self, mp3_path):
+        """Convert MP3 to WAV format"""
+        wav_path = os.path.join(self.temp_dir, 
+                               os.path.splitext(os.path.basename(mp3_path))[0] + '.wav')
+        if not os.path.exists(wav_path):
+            audio = AudioSegment.from_mp3(mp3_path)
+            audio.export(wav_path, format='wav')
+        return wav_path
     def __getitem__(self, idx):
         """
         Get a spectrogram and its corresponding filename.
