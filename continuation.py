@@ -14,7 +14,41 @@ from VQ_VAE_2_1D_data import create_dataloader
 from scipy.io.wavfile import write  # For saving audio
 from torch.optim.lr_scheduler import LambdaLR 
 import matplotlib.pyplot as plt
+class ARTransformer(nn.Module):
+    """
+    Autoregressive Transformer for music generation based on Qwen 2.5.
+    This model predicts the next audio token in the sequence given preceding tokens.
+    """
 
+    def __init__(self, input_dim, num_layers, num_heads, hidden_dim, vocab_size, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, input_dim)
+        self.transformer = nn.Transformer(
+            d_model=input_dim,
+            nhead=num_heads,
+            num_encoder_layers=num_layers,
+            num_decoder_layers=num_layers,
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.fc_out = nn.Linear(input_dim, vocab_size)
+
+    def forward(self, src, tgt):
+        """
+        Forward pass for the AR Transformer.
+        Args:
+            src: Input sequence (e.g., tokenized text/audio prompts).
+            tgt: Target sequence (e.g., tokenized audio tokens).
+        Returns:
+            Output logits for the next token prediction.
+        """
+        src_emb = self.embedding(src)
+        tgt_emb = self.embedding(tgt)
+        transformer_out = self.transformer(src_emb, tgt_emb)
+        logits = self.fc_out(transformer_out)
+        return logits
+    
 class ResidualBlock1D(nn.Module):
 
     def __init__(self, in_channels, out_channels, mid_channels=None, dropout_prob=0.2):  # Add dropout_prob
@@ -127,7 +161,17 @@ class VectorQuantizer(nn.Module):
         #print(f"Final quantized shape: {quantized.shape}")
         return quantized
 
-
+def apply_cfg(logits, guidance_scale=3.0):
+    """
+    Apply Classifier-Free Guidance (CFG) to the logits.
+    Args:
+        logits: Model output logits.
+        guidance_scale: Guidance scale for CFG.
+    Returns:
+        Adjusted logits with CFG applied.
+    """
+    conditional_logits, unconditional_logits = logits
+    return unconditional_logits + guidance_scale * (conditional_logits - unconditional_logits)
 
 class Encoder1D(nn.Module):
 
@@ -493,10 +537,28 @@ def warmup_lr_scheduler(optimizer, warmup_epochs, total_epochs):
             return epoch / warmup_epochs  # Linear warm-up
         return 1.0  # Keep learning rate constant after warm-up
     return LambdaLR(optimizer, lr_lambda)
+def train_ar_transformer(model, data_loader, optimizer, device, num_epochs, guidance_scale=3.0):
+    model.train()
+    for epoch in range(num_epochs):
+        for batch in data_loader:
+            src, tgt = batch
+            src, tgt = src.to(device), tgt.to(device)
 
+            optimizer.zero_grad()
+            logits = model(src, tgt)
+
+            # Apply CFG during training
+            if random.random() < 0.7:  # Drop conditions with 70% probability
+                logits = apply_cfg(logits, guidance_scale)
+
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), tgt.view(-1))
+            loss.backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch + 1}/{num_epochs} completed. Loss: {loss.item():.4f}")
 if __name__ == '__main__':
 
-
+    
     # Set random seed for reproducibility
     SEED = 42
     torch.manual_seed(SEED)
@@ -529,6 +591,14 @@ if __name__ == '__main__':
     if not os.path.exists(CHECKPOINT_DIR):
         os.makedirs(CHECKPOINT_DIR)
         print(f"Created checkpoint directory: {CHECKPOINT_DIR}")
+    ar_transformer = ARTransformer(
+        input_dim=896,  # For InspireMusic-0.5B
+        num_layers=12,
+        num_heads=8,
+        hidden_dim=2048,
+        vocab_size=50000,  # Example vocabulary size
+        dropout=0.1
+    ).to(device)
 
 
     model = VQVAE2_1D(
@@ -554,78 +624,94 @@ if __name__ == '__main__':
         num_workers=2,
         shuffle=True
     )
+    CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, 'vqvae1d_epoch_30.pth')
+
+    # Load checkpoint if it exists
+    start_epoch = 1
+    if os.path.exists(CHECKPOINT_PATH):
+        print(f"Loading checkpoint from {CHECKPOINT_PATH}...")
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1  # Resume from the next epoch
+        print(f"Checkpoint loaded. Resuming from epoch {start_epoch}.")
+    else:
+        print(f"No checkpoint found at {CHECKPOINT_PATH}. Starting training from scratch.")
 
     print("\nStarting Training...")
     all_train_losses = []
     WARMUP_EPOCHS = 5  # Number of warm-up epochs
     scheduler = warmup_lr_scheduler(optimizer, warmup_epochs=WARMUP_EPOCHS, total_epochs=NUM_EPOCHS)
-    for epoch in range(1, NUM_EPOCHS + 1):
-        epoch_losses, sample_recon,sample_input = train_vqvae_1d(
-            model=model,
-            train_loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            log_interval=LOG_INTERVAL,
-            gradient_clip_val=GRADIENT_CLIP
-        )
-        all_train_losses.append(epoch_losses)
-        scheduler.step()  # Step the learning rate scheduler
-        # Reset underused codes in vector quantizers
-        #reset_unused_codes(model.vq_b)
-        #reset_unused_codes(model.vq_m)
-        #reset_unused_codes(model.vq_t)
 
-        if epoch % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS:
-            checkpoint_path = os.path.join(CHECKPOINT_DIR, f'vqvae1d_epoch_{epoch}.pth')
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': epoch_losses,  # Save last epoch's average loss
-            }, checkpoint_path)
-            print(f"====> Saved checkpoint to {checkpoint_path}")
-            try:
-                # Adjust epochs_range to match the length of all_train_losses
-                epochs_range = range(1, len(all_train_losses) + 1)
-                total_losses = [l['total_loss'] for l in all_train_losses]
-                recon_losses = [l['recon_loss'] for l in all_train_losses]
-                spectral_losses = [l['spectral_loss'] for l in all_train_losses]
-                vq_losses = [l['vq_loss'] for l in all_train_losses]
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
+        if epoch <= 30:
+            epoch_losses, sample_recon, sample_input = train_vqvae_1d(
+                model=model,
+                train_loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                epoch=epoch,
+                log_interval=LOG_INTERVAL,
+                gradient_clip_val=GRADIENT_CLIP
+            )
+            all_train_losses.append(epoch_losses)
+            scheduler.step()  # Step the learning rate scheduler
 
-                plt.figure(figsize=(10, 5))
-                plt.plot(epochs_range, total_losses, label='Total Loss')
-                plt.plot(epochs_range, recon_losses, label='Reconstruction Loss', linestyle='--')
-                plt.plot(epochs_range, spectral_losses, label='Spectral Loss', linestyle='-.')
-                plt.plot(epochs_range, vq_losses, label='VQ Loss', linestyle=':')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss')
-                plt.title('Training Losses')
-                plt.legend()
-                plt.grid(True)
-                plt.savefig(os.path.join(CHECKPOINT_DIR, 'training_losses.png'))
-                print(f"Saved training loss plot to {os.path.join(CHECKPOINT_DIR, 'training_losses.png')}")
+            if epoch % SAVE_INTERVAL == 0 or epoch == NUM_EPOCHS:
+                checkpoint_path = os.path.join(CHECKPOINT_DIR, f'vqvae1d_epoch_{epoch}.pth')
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': epoch_losses,  # Save last epoch's average loss
+                }, checkpoint_path)
+                print(f"====> Saved checkpoint to {checkpoint_path}")
 
-            except ImportError:
-                print("\nmatplotlib not found. Skipping loss plot generation.")
-                print("Install it with: pip install matplotlib")
+            # Save reconstructed audio samples
+            if sample_recon is not None and sample_input is not None:
+                sample_input = sample_input.squeeze()
+                sample_input = np.clip(sample_input, -1.0, 1.0)
+                audio_path_input = os.path.join(CHECKPOINT_DIR, f'input_epoch_{epoch}.wav')
+                write(audio_path_input, sample_rate, (sample_input * 32767).astype('int16'))
+                print(f"====> Saved input audio to {audio_path_input}")
 
-        if sample_recon is not None and sample_input is not None:
-            # Save input audio
-            sample_input = sample_input.squeeze()  # Remove channel dimension
-            print(f"Sample input shape: {sample_input.shape}")
-            sample_input = np.clip(sample_input, -1.0, 1.0)  # Ensure within valid range
-            audio_path_input = os.path.join(CHECKPOINT_DIR, f'input_epoch_{epoch}.wav')
-            write(audio_path_input, sample_rate, (sample_input * 32767).astype('int16'))
-            print(f"====> Saved input audio to {audio_path_input}")
+                sample_recon = sample_recon.squeeze()
+                sample_recon = np.clip(sample_recon, -1.0, 1.0)
+                audio_path_recon = os.path.join(CHECKPOINT_DIR, f'reconstruction_epoch_{epoch}.wav')
+                write(audio_path_recon, sample_rate, (sample_recon * 32767).astype('int16'))
+                print(f"====> Saved reconstructed audio to {audio_path_recon}")
+        else:
+            # Freeze VQVAE weights
+            if epoch == 31:
+                for param in model.parameters():
+                    param.requires_grad = False
+                print("====> VQVAE weights frozen. Passing quantized inputs to the transformer.")
 
-            # Save reconstructed audio
-            sample_recon = sample_recon.squeeze()  
-            sample_recon = np.clip(sample_recon, -1.0, 1.0)  # Clip to valid range
-            audio_path_recon = os.path.join(CHECKPOINT_DIR, f'reconstruction_epoch_{epoch}.wav')
-            write(audio_path_recon, sample_rate, (sample_recon * 32767).astype('int16'))  
-            print(f"====> Saved reconstructed audio to {audio_path_recon}")
+            # Initialize optimizer for AR Transformer if not already done
+            if epoch == 31:
+                ar_optimizer = optim.Adam(ar_transformer.parameters(), lr=LEARNING_RATE)
+                print("====> AR Transformer optimizer initialized.")
 
-    print("\nTraining Finished.")
+            # Train the transformer
+            for batch in train_loader:
+                data, target = batch
+                data, target = data.to(device), target.to(device)
+
+                # Get quantized inputs from VQVAE
+                _, _, _, indices_b, indices_m, indices_t = model.encode(data)
+
+                # Prepare transformer inputs (e.g., using bottom-level indices)
+                transformer_input = indices_b
+                transformer_target = target
+
+                # Train the transformer
+                ar_optimizer.zero_grad()
+                logits = ar_transformer(transformer_input[:, :-1], transformer_input[:, 1:])
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), transformer_target.view(-1))
+                print(f"Transformer Loss: {loss.item():.4f}")
+                loss.backward()
+                ar_optimizer.step()
+
+            print(f"Epoch {epoch}/{NUM_EPOCHS} completed. Transformer Loss: {loss.item():.4f}")
 
 
