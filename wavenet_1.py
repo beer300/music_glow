@@ -9,6 +9,7 @@ from scipy.io.wavfile import write  # Import for saving audio as WAV
 from tqdm import tqdm
 import matplotlib.pyplot as plt 
 import os
+
 class WaveNet(nn.Module):
     def __init__(self, input_channels, residual_channels, dilation_channels, skip_channels, kernel_size, num_classes, num_layers):
         super(WaveNet, self).__init__()
@@ -93,7 +94,7 @@ if __name__ == "__main__":
     model = WaveNet(input_channels, residual_channels, dilation_channels, skip_channels, kernel_size, num_classes, num_layers)
 
     # Path to audio file or directory
-    audio_path = r"C:\Users\lukas\Music\youtube_wav_files"
+    audio_path = r"C:\Users\lukas\Music\chopped_30-20250108T164615Z-001\chopped_30"
     # Define base directories for saving files
     base_dir = r"C:\Users\lukas\Music\wavenet"
     audio_dir = os.path.join(base_dir, "audio")
@@ -108,7 +109,7 @@ if __name__ == "__main__":
     sequence_length = 16000*4*3  # 1 second of audio at 16kHz
     batch_size = 8
     dataset = WaveNetDataset(audio_path, sequence_length, num_classes)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     # Define loss function and optimizer
     criterion = nn.CrossEntropyLoss()  # Cross-entropy loss for classification
@@ -140,8 +141,10 @@ if __name__ == "__main__":
 
             # Forward pass with mixed precision
             with torch.amp.autocast("cuda"):
+                #print(f"Input shape: {inputs.shape}, Target shape: {targets.shape}")
                 outputs = model(inputs)
                 # Reshape outputs and targets for CrossEntropyLoss
+                #print(f"Model output shape: {outputs.shape}")
                 outputs = outputs.permute(0, 2, 1)  # Shape: (batch_size, sequence_length, num_classes)
                 outputs = outputs.reshape(-1, outputs.size(-1))  # Flatten outputs to (batch_size * sequence_length, num_classes)
                 targets = targets.view(-1)  # Flatten targets to (batch_size * sequence_length)
@@ -152,6 +155,8 @@ if __name__ == "__main__":
                 targets = targets[:min_size]  # Trim targets to match the smaller size
 
                 # Compute loss
+                #print(f"Outputs shape: {outputs.shape}, Targets shape: {targets.shape}")
+
                 loss = criterion(outputs, targets)
 
             # Backward pass and optimization with mixed precision
